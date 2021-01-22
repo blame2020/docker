@@ -1,0 +1,258 @@
+# See https://docs.docker.com/engine/install/centos/ for details of how to
+
+- name: Uninstall old versions docker
+  become: yes
+  yum:
+    state: absent
+    name:
+      - docker
+      - docker-client
+      - docker-client-latest
+      - docker-common
+      - docker-latest
+      - docker-latest-logrotate
+      - docker-logrotate
+      - docker-engine
+
+# From https://download.docker.com/linux/centos/docker-ce.repo
+
+- name: Setup the repository for docker-ce-stable
+  become: yes
+  yum_repository:
+    file: docker-ce
+    name: docker-ce-stable
+    description: Docker CE Stable - $basearch
+    baseurl: https://download.docker.com/linux/centos/$releasever/$basearch/stable
+    enabled: yes
+    gpgcheck: yes
+    gpgkey: https://download.docker.com/linux/centos/gpg
+
+- name: Setup the repository for docker-ce-stable-debuginfo
+  become: yes
+  yum_repository:
+    file: docker-ce
+    name: docker-ce-stable-debuginfo
+    description: Docker CE Stable - Debuginfo $basearch
+    baseurl: https://download.docker.com/linux/centos/$releasever/debug-$basearch/stable
+    enabled: no
+    gpgcheck: yes
+    gpgkey: https://download.docker.com/linux/centos/gpg
+
+- name: Setup the repository for docker-ce-stable-source
+  become: yes
+  yum_repository:
+    file: docker-ce
+    name: docker-ce-stable-source
+    description: Docker CE Stable - Sources
+    baseurl: https://download.docker.com/linux/centos/$releasever/source/stable
+    enabled: no
+    gpgcheck: yes
+    gpgkey: https://download.docker.com/linux/centos/gpg
+
+- name: Install packages
+  become: yes
+  yum:
+    state: latest
+    name:
+      - docker-ce
+      - docker-ce-cli
+      - containerd.io
+      - python3
+      - python3-pip
+
+- name: Install python modules for Docker SDK for Python
+  become: yes
+  pip:
+    executable: pip3
+    state: present
+    name: docker[tls]
+
+- block:
+
+  - name: Create docker client user
+    user:
+      name: "{{docker_cli_user}}"
+      groups: docker
+      create_home: yes
+
+  - name: Create directory .ssh for client user
+    when: docker_cli_user_public_keys is defined
+    file:
+      path: "/home/{{docker_cli_user}}/.ssh"
+      state: directory
+      owner: root
+      group: "{{docker_cli_user}}"
+      mode: 0750
+
+  - name: Store ssh public keys for client user
+    when: docker_cli_user_public_keys is defined
+    lineinfile:
+      path: "/home/{{docker_cli_user}}/.ssh/authorized_keys"
+      state: present
+      create: yes
+      owner: root
+      group: "{{docker_cli_user}}"
+      mode: 0640
+      line: "{{item}}"
+    with_items: "{{docker_cli_user_public_keys}}"
+
+  - name: Remove ssh public keys for client user
+    when: docker_cli_user_absent_public_keys is defined
+    lineinfile:
+      path: "/home/{{docker_cli_user}}/.ssh/authorized_keys"
+      state: absent
+      create: yes
+      owner: root
+      group: "{{docker_cli_user}}"
+      mode: 0640
+      line: "{{item}}"
+    with_items: "{{docker_cli_user_absent_public_keys}}"
+
+  become: yes
+  when: docker_cli_user is defined
+
+- name: Create directories for external volumes
+  become: yes
+  file:
+    path: "{{item}}"
+    owner: root
+    group: root
+    seuser: system_u
+    serole: object_r
+    setype: container_file_t
+    mode: 0700
+    state: directory
+  with_items: "{{external_volumes}}"
+
+- name: Set file context for external volumes
+  become: yes
+  community.general.sefcontext:
+    state: present
+    ftype: a
+    setype: container_file_t
+    seuser: system_u
+    target: "{{item.rstrip('/')}}(/.*)?"
+  with_items: "{{external_volumes}}"
+
+- name: Apply selinux context
+  become: yes
+  command: "restorecon -R {{item}}"
+  with_items: "{{external_volumes}}"
+
+- name: make directory /etc/docker
+  become: yes
+  file:
+    path: /etc/docker
+    state: directory
+    owner: root
+    group: root
+
+- name: Configure /etc/docker/daemon.json
+  become: yes
+  register: daemon_json
+  copy:
+    src: daemon.json
+    dest: /etc/docker/daemon.json
+    owner: root
+    group: root
+    force: yes
+
+- name: semanage permissive -a container_t
+  become: yes
+  community.general.selinux_permissive:
+    permissive: yes
+    name: container_t
+
+- name: Restart docker
+  become: yes
+  throttle: 1
+  when: daemon_json is changed
+  systemd:
+    state: restarted
+    enabled: yes
+    name: docker.service
+
+- name: Start docker
+  become: yes
+  systemd:
+    state: started
+    enabled: yes
+    name: docker.service
+
+# https://docs.docker.com/engine/swarm/ingress/
+- name: Allow listen ports 2377/tcp, 4789/udp and 7946/tcp,udp for docker
+  become: yes
+  firewalld:
+    state: enabled
+    permanent: yes
+    immediate: yes
+    port: "{{item}}"
+  with_items:
+    - 2377/tcp
+    - 4789/udp
+    - 7946/tcp
+    - 7946/udp
+
+- name: Allow listen ports for services
+  become: yes
+  when: docker_service_ports is defined
+  firewalld:
+    state: enabled
+    permanent: yes
+    immediate: yes
+    port: "{{item}}"
+  with_items: "{{docker_service_ports}}"
+
+- name: Initalize swarm mode as manager
+  when: docker_swarm_join_to is not defined
+  become: yes
+  register: manager_result
+  community.general.docker_swarm:
+    state: present
+    listen_addr: "{{ docker_swarm_listen_addr | default('0.0.0.0:2377') }}"
+    advertise_addr: "{{ docker_swarm_advertise_addr|default(ansible_default_ipv4.address + ':2377') }}"
+    autolock_managers: no
+    force: no
+
+- name: Join as swarm node
+  become: yes
+  when: docker_swarm_join_to is defined
+  community.general.docker_swarm:
+    state: join
+    listen_addr: "{{ docker_swarm_listen_addr | default('0.0.0.0:2377') }}"
+    advertise_addr: "{{ docker_swarm_advertise_addr|default(ansible_default_ipv4.address + ':2377') }}"
+    autolock_managers: no
+    join_token: "{{ hostvars[docker_swarm_join_to]['manager_result'].swarm_facts.JoinTokens[docker_swarm_join_role|default('manager')|capitalize]}}"
+    remote_addrs: [ "{{ docker_swarm_join_to }}:2377" ]
+    force: no
+
+# https://github.com/google/cadvisor
+- name: Start cAdvisor
+  become: yes
+  community.general.docker_container:
+    name: cadvisor
+    image: google/cadvisor:latest
+    command: "-logtostderr -docker_only"
+    force_kill: yes
+    container_default_behavior: no_defaults
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    published_ports:
+      - "{{cadvisor_port|default('9100')}}:8080"
+    restart_policy: always
+    memory: "256M"
+    cpus: 1.0
+    detach: yes
+    privileged: yes
+
+- name: Allow the port for cadvisor
+  become: yes
+  firewalld:
+    state: enabled
+    permanent: yes
+    immediate: yes
+    port: "{{cadvisor_port|default('9100')}}/tcp"
